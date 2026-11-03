@@ -8,6 +8,7 @@
     GET /characters/search    find characters by name
     GET /characters/{name}    stats, gear, skills (?server= when the name is ambiguous)
     GET /characters/{name}/daevanion[/{board}]   Daevanion boards
+    GET /characters/equipment/item   one equipped item's details, by ids
 
 Run:
     uvicorn app:app --reload
@@ -20,6 +21,7 @@ Upstream failures are mapped to HTTP statuses in one place, see `api_error` belo
 
 from __future__ import annotations
 
+import hmac
 import os
 from typing import Any, Dict, List, Literal, Optional
 
@@ -40,7 +42,9 @@ from aion2_api import (
     find_board,
     get_character,
     get_daevanion_board,
+    get_equipment_item,
     resolve_character,
+    resolve_server_region,
     search_characters,
     server_list,
 )
@@ -59,6 +63,27 @@ app = FastAPI(
         "No API key or login is needed; the data is public."
     ),
 )
+
+
+# ---------------------------------------------------------------- access key
+
+# Optional shared secret for a deployment that only a backend (e.g. a Next.js
+# server) should call. Unset or blank -> the API stays open, exactly as before.
+# Set -> every route except "/" needs a matching X-Internal-Key header. "/" stays
+# open because it is static, touches no upstream, and is the platform health check.
+INTERNAL_KEY = os.environ.get("AION2_API_INTERNAL_KEY", "").strip()
+INTERNAL_KEY_HEADER = "X-Internal-Key"
+OPEN_PATHS = frozenset({"/"})
+
+
+@app.middleware("http")
+async def require_internal_key(request: Request, call_next):
+    if INTERNAL_KEY and request.url.path not in OPEN_PATHS:
+        supplied = request.headers.get(INTERNAL_KEY_HEADER, "")
+        # Bytes, so a non-ASCII header cannot raise; constant-time either way.
+        if not hmac.compare_digest(supplied.encode("utf-8"), INTERNAL_KEY.encode("utf-8")):
+            return JSONResponse(status_code=401, content={"detail": "Missing or invalid internal key"})
+    return await call_next(request)
 
 
 # --------------------------------------------------------------------- schemas
@@ -222,6 +247,8 @@ def root() -> Dict[str, Any]:
             "character stats and gear": "/characters/s6x?server=Siel",
             "their Daevanion boards": "/characters/s6x/daevanion?server=Siel",
             "one board": "/characters/s6x/daevanion/Nezekan?server=Siel",
+            "one item's details (ids from the character answer)": "/characters/equipment/item"
+            "?characterId=...&serverId=1501&id=110130050&slotPos=1&enchantLevel=10&exceedLevel=0",
         },
         "boards": GLOBAL_BOARDS,
         "browsable_docs": "/docs",
@@ -330,17 +357,66 @@ def character_search(
     return [CharacterHit(**c) for c in search_characters(name, region)]
 
 
+@app.get(
+    "/characters/equipment/item",
+    tags=["characters"],
+    summary="One equipped item's details (soul binding, rolled stats, stones)",
+)
+def character_equipment_item(
+    character_id: str = Query(
+        ..., alias="characterId", min_length=1, description="`profile.characterId` from /characters/{name}"
+    ),
+    server_id: str = Query(
+        ..., alias="serverId", pattern=r"^\d{4}$", description="`profile.serverId` from /characters/{name}, e.g. 1501"
+    ),
+    item_id: int = Query(..., alias="id", ge=1, description="The equipmentList entry's `id`"),
+    slot_pos: int = Query(..., alias="slotPos", ge=1, description="Its `slotPos`"),
+    enchant_level: int = Query(..., alias="enchantLevel", ge=0, description="Its `enchantLevel`"),
+    exceed_level: int = Query(..., alias="exceedLevel", ge=0, description="Its `exceedLevel`"),
+    region: Optional[Literal["nae", "naw", "eu", "la", "as"]] = Query(
+        None, description="Default: the server's own region"
+    ),
+) -> Dict[str, Any]:
+    """NCSOFT's detail for exactly one equipped item, passed through unchanged:
+    `soulBindRate`, `mainStats`, `subStats`, `subStatCount`, `subSkillCountMax`,
+    `magicStoneStat`, `godStoneStat`, and `subSkills` when NCSOFT sends it.
+
+    Takes the ids straight from a /characters/{name} answer - `characterId` and
+    `serverId` from `profile`, the other four from the `equipmentList` entry - so
+    it costs one upstream request and no name lookup. Cached for 60s per
+    character, item, slot and level; identical requests at once share one call.
+    """
+    item = {"id": item_id, "slotPos": slot_pos, "enchantLevel": enchant_level, "exceedLevel": exceed_level}
+    return get_equipment_item(
+        character_id, server_id, item, region or resolve_server_region(server_id)
+    )
+
+
 @app.get("/characters/{name}", tags=["characters"], summary="A character's stats, gear and skills")
-def character(name: str, server: Optional[str] = Depends(server_query)) -> Dict[str, Any]:
+def character(
+    name: str,
+    server: Optional[str] = Depends(server_query),
+    item_details: bool = Query(
+        False,
+        description="Also attach each item's `itemDetail` (soul binding, rolled stats, stones). "
+        "One extra upstream request per item, so ~25s slower when not cached",
+    ),
+) -> Dict[str, Any]:
     """NCSOFT's info and equipment responses, merged and passed through unchanged:
     `profile`, `stat.statList`, `title`, `ranking`, `daevanion.boardList`,
     `equipment`, `petwing`, `skill.skillList`.
+
+    With `?item_details=true`, each `equipment.equipmentList` entry also carries
+    `itemDetail`: NCSOFT's per-item response, unchanged (`soulBindRate`,
+    `mainStats`, `subStats`, `magicStoneStat`, `godStoneStat`, and `subSkills`
+    when NCSOFT sends it). An item whose detail could not be fetched just has no
+    `itemDetail`; the rest of the answer is unaffected.
 
     404 when no character has that exact name; 409 (with `candidates`) when
     several do - add `?server=`.
     """
     c = resolve_character(name, server)
-    return get_character(c["character_id"], c["server_id"], c["region"])
+    return get_character(c["character_id"], c["server_id"], c["region"], item_details=item_details)
 
 
 @app.get("/characters/{name}/daevanion", tags=["characters"], summary="A character's Daevanion boards")

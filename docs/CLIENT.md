@@ -100,6 +100,14 @@ board = get_daevanion_board(c["character_id"], c["server_id"], boards[0]["id"], 
 print(render_daevanion_board(board["nodeList"]))  # 15x15 text grid
 ```
 
+- **Item details are opt-in, and best fetched one at a time.** For one item (say, when a user
+  hovers it), call `get_equipment_item(c["character_id"], c["server_id"], item, c["region"])`
+  with the `equipmentList` entry: one request, cached for 60 s per character, item, slot and
+  level. Over the web API that is `GET /characters/equipment/item` with `characterId` and
+  `serverId` from `profile` plus the entry's `id`, `slotPos`, `enchantLevel` and `exceedLevel`.
+  `get_character(..., item_details=True)` (or `?item_details=true`) still attaches `itemDetail`
+  to every item at once, but that is one request per item — about 25 s for a full set the first
+  time. Off, the call makes just two requests.
 - **Names are not unique.** The same name can exist on several servers. `resolve_character`
   raises `LookupError` listing the candidates; pass `server=` (name or id) to pick one.
 - **A server id is faster than a name.** Server ids are unique and encode the region

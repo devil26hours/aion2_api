@@ -27,7 +27,7 @@ uv run python test_app.py     # web API routes
 
 No network and no pytest — just `assert`s.
 
-`test_aion2.py` (34 checks, standard library only) covers the server-population table parser
+`test_aion2.py` (37 checks, standard library only) covers the server-population table parser
 (including a page that drops the optional population columns, one that drops a required one, and a
 row cut short of the optional columns),
 the notice paging, the locale mapping, the event status maths, the rate-limit behaviour
@@ -36,11 +36,13 @@ and the character code (link parsing, region fallback, the first-party roster an
 mapping, the roster-backed region lookup and its offline fallback, name resolution and its cache,
 Daevanion grid placement).
 
-`test_app.py` (12 checks) drives the FastAPI app through its test client with the upstream calls
+`test_app.py` (22 checks) drives the FastAPI app through its test client with the upstream calls
 faked: search and its `region` validation, `?server=` pass-through, `409` with `candidates` for
 an ambiguous name, `404` for an unknown name or board, a `/servers` response whose optional
 population columns are `null`, `/servers/roster` and its `502` when the upstream list fails,
-board lookup by name or id, and how upstream failures map to `404` / `502` / `503`. It needs `httpx2`, which `uv sync` installs from
+board lookup by name or id, how upstream failures map to `404` / `502` / `503`, and the
+optional `AION2_API_INTERNAL_KEY` gate (`/` open, `401` on a missing or wrong `X-Internal-Key`,
+the route reached with the right one, and no change at all when the variable is unset). It needs `httpx2`, which `uv sync` installs from
 the `dev` group; the web service itself does not depend on it.
 
 Both counts above are asserted by `test_documented_check_counts_match_the_suites`, so this page

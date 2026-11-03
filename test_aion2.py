@@ -11,6 +11,8 @@ import contextlib
 import io
 import os
 import re
+import threading
+import urllib.parse
 from io import BytesIO
 from urllib.error import HTTPError
 
@@ -570,6 +572,133 @@ def test_character_url_and_region_fallback():
             assert tried == [("info", "as")]
     finally:
         aion2_api.get_json = real
+
+
+def test_character_item_details_are_best_effort():
+    gear = [
+        {"id": 1, "slotPos": 1, "enchantLevel": 10, "exceedLevel": 0, "name": "ok"},
+        {"id": 2, "slotPos": 2, "enchantLevel": 5, "exceedLevel": 0, "name": "fails"},
+        {"id": None, "slotPos": 3, "enchantLevel": 0, "exceedLevel": 0, "name": "no id"},
+        {"id": 4, "slotPos": 4, "enchantLevel": 0, "exceedLevel": 0, "name": "blocked"},
+        {"id": 5, "slotPos": 5, "enchantLevel": 0, "exceedLevel": 0, "name": "never asked"},
+    ]
+    detail = {"soulBindRate": "50.4", "subStats": [{"id": "Critical", "value": "56"}], "godStoneStat": []}
+    asked = []
+
+    def fake_get_json(url, headers, timeout, params):
+        if url.endswith("/info"):
+            return {"profile": {}}
+        if url.endswith("/equipment"):
+            return {"equipment": {"equipmentList": [dict(g) for g in gear], "skinList": []}}
+        assert url.endswith("/equipment/item"), url
+        assert params["region"] == "as" and params["characterId"] == "rKx=" and params["serverId"] == "1501"
+        asked.append(params["id"])
+        if params["id"] == 2:
+            raise Aion2ApiError(500, url, "boom")
+        if params["id"] == 4:
+            raise Aion2ApiError(403, url, "blocked")
+        return {**detail, "id": params["id"], "slotPos": params["slotPos"], "enchantLevel": params["enchantLevel"]}
+
+    real = aion2_api.get_json
+    aion2_api.get_json = fake_get_json
+    try:
+        got = aion2_api.get_character("rKx=", "1501", "as", item_details=True)
+        items = got["equipment"]["equipmentList"]
+        # Original fields untouched, in order; skinList etc. still there.
+        assert [{k: v for k, v in it.items() if k != "itemDetail"} for it in items] == gear
+        assert got["equipment"]["skinList"] == [] and got["profile"] == {}
+        # The whole response is kept, not just the illustrative fields.
+        assert items[0]["itemDetail"] == {**detail, "id": 1, "slotPos": 1, "enchantLevel": 10}
+        # A failure skips that item; a bad entry is never sent; a 403 stops the rest.
+        assert [("itemDetail" in it) for it in items] == [True, False, False, False, False]
+        assert asked == [1, 2, 4], asked
+
+        asked.clear()
+        plain = aion2_api.get_character("rKx=", "1501", "as")  # off by default
+        assert asked == [] and "itemDetail" not in plain["equipment"]["equipmentList"][0]
+    finally:
+        aion2_api.get_json = real
+
+    try:
+        aion2_api.get_equipment_item("rKx=", "1501", {"id": 1, "slotPos": 1, "enchantLevel": True}, "as")
+        raise AssertionError("a bool is not an enchant level")
+    except ValueError:
+        pass
+
+
+ITEM = {"id": 110130050, "slotPos": 1, "enchantLevel": 10, "exceedLevel": 0}
+
+
+def test_equipment_item_is_one_request_cached_per_item():
+    """Real _fetch, fake network: the URL (every parameter) is the cache key."""
+    aion2_api.clear_cache()
+    calls, _, originals = with_fakes(['{"soulBindRate": "%d"}' % n for n in range(1, 8)] + [500, "<html>", '{"ok": 1}'])
+    item = lambda **change: {**ITEM, **change}
+    get = lambda cid="rKx=", it=ITEM: aion2_api.get_equipment_item(cid, "1501", it, "as")
+    try:
+        first = get()
+        assert first == {"soulBindRate": "1"} and len(calls) == 1
+        url = urllib.parse.urlsplit(calls[0])
+        assert url.path == "/api/character/equipment/item", url.path
+        assert urllib.parse.parse_qs(url.query) == {
+            "region": ["as"], "lang": ["en-US"], "characterId": ["rKx="], "serverId": ["1501"],
+            "id": ["110130050"], "slotPos": ["1"], "enchantLevel": ["10"], "exceedLevel": ["0"],
+        }, url.query
+
+        assert get() == first and get("rKx%3D") == first and len(calls) == 1, "same item -> cache"
+        assert get(it=item(id=110130051))["soulBindRate"] == "2", "another item"
+        assert get("other=")["soulBindRate"] == "3", "another character"
+        assert get(it=item(enchantLevel=11))["soulBindRate"] == "4", "another enchant level"
+        assert get(it=item(exceedLevel=1))["soulBindRate"] == "5", "another exceed level"
+        assert get(it=item(slotPos=2))["soulBindRate"] == "6", "another slot"
+        assert aion2_api.get_equipment_item("rKx=", "1501", ITEM, "nae")["soulBindRate"] == "7", "another region"
+        assert len(calls) == 7 and get() == first
+
+        fresh = item(id=1)
+        for _ in range(2):  # a 500, then a body that is not JSON: neither may be reused
+            try:
+                get(it=fresh)
+                raise AssertionError("a failed request must raise")
+            except Aion2ApiError:
+                pass
+        assert get(it=fresh) == {"ok": 1} and len(calls) == 10, "failures are retried, not cached"
+    finally:
+        restore(originals)
+        aion2_api.clear_cache()
+
+
+def test_identical_item_requests_in_flight_share_one_call():
+    aion2_api.clear_cache()
+    calls, _, originals = with_fakes([])
+    release = threading.Event()
+
+    def slow_urlopen(req, timeout=None):
+        calls.append(req.full_url)
+        release.wait(5)
+        return FakeResponse('{"soulBindRate": "50.4"}')
+
+    aion2_api.urllib.request.urlopen = slow_urlopen
+    results = []
+    worker = lambda: results.append(aion2_api.get_equipment_item("rKx=", "1501", ITEM, "as"))
+    threads = [threading.Thread(target=worker) for _ in range(3)]
+    try:
+        for t in threads:
+            t.start()
+        key = ("as", "rKx=", "1501", *ITEM.values())
+        for _ in range(500):  # until all three are waiting on (or inside) the one call
+            if len(calls) == 1 and (aion2_api._item_inflight.get(key) or [None, 0])[1] == 3:
+                break
+            threading.Event().wait(0.01)
+        release.set()
+        for t in threads:
+            t.join(5)
+        assert len(calls) == 1, calls
+        assert results == [{"soulBindRate": "50.4"}] * 3, results
+        assert not aion2_api._item_inflight, "the in-flight entry must be dropped afterwards"
+    finally:
+        release.set()
+        restore(originals)
+        aion2_api.clear_cache()
 
 
 def test_resolve_character_by_name():

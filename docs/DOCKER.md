@@ -51,4 +51,58 @@ and a small init as PID 1. Those were tested against this image rather than assu
 fails with `Read-only file system` while `touch /tmp/canary` succeeds, and the service still answers
 `/openapi.json`.
 
+## Locking it to your backend
+
+Deployed publicly, anyone who finds the URL can call it, and every caller shares the same polite
+upstream budget (one request per second per host) and the same outbound IP. When only your own
+server should call it, for example a Next.js backend on Vercel, set a shared secret:
+
+| Variable | Where | Effect |
+|---|---|---|
+| `AION2_API_INTERNAL_KEY` | The API's environment (e.g. Railway) | Every route except `/` answers `401 {"detail": "Missing or invalid internal key"}` unless the request sends the same value in the `X-Internal-Key` header. |
+
+- **Unset or blank:** the API behaves exactly as before, open to everyone. Local development,
+  `docker run` and CI need nothing.
+- **`/` stays open.** It is static, never calls upstream, and is what a platform health check
+  should probe. `/docs` and `/openapi.json` are behind the key like everything else.
+- The comparison is constant-time (`hmac.compare_digest`). The key is never echoed in a response
+  and never logged.
+
+Generate a long random value, and paste it straight into each platform's secret settings. Never
+commit it, and never put a real value in docs or issues:
+
+```bash
+openssl rand -hex 32
+# or, without openssl:
+python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+The **same value** goes in two places:
+
+1. **The API** (Railway → service → Variables): `AION2_API_INTERNAL_KEY`.
+2. **The calling server** (Vercel → project → Environment Variables): a server-only variable,
+   e.g. `AION2_API_INTERNAL_KEY`. Never a `NEXT_PUBLIC_` name, because those are bundled into
+   browser JavaScript.
+
+On the Next.js side, call the API only from server code (route handlers, server components, server
+actions) and send the header there:
+
+```ts
+import "server-only";
+
+export async function aion2(path: string) {
+  return fetch(`${process.env.AION2_API_URL}${path}`, {
+    headers: { "X-Internal-Key": process.env.AION2_API_INTERNAL_KEY! },
+  });
+}
+```
+
+To rotate the key, set a new value on both sides and redeploy both. Requests are refused with `401`
+until the two match again.
+
+Railway runs this image as it is. Set `PORT=8000` so Railway routes to the port the image listens
+on, point the service's health check at `/`, and keep a single replica. The cache and the
+per-host throttle live in process memory, so more replicas would multiply the request rate to
+upstream.
+
 ---

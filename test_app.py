@@ -79,11 +79,105 @@ def test_character_passes_server_through():
         seen.append((name, server))
         return dict(S6X)
 
-    with fakes(resolve_character=fake_resolve, get_character=lambda cid, sid, region: {"profile": {"characterName": "s6x"}}):
+    with fakes(resolve_character=fake_resolve, get_character=lambda cid, sid, region, item_details: {"profile": {"characterName": "s6x"}}):
         r = client.get("/characters/s6x", params={"server": "Siel"})
         assert r.status_code == 200, r.text
         assert r.json() == {"profile": {"characterName": "s6x"}}
         assert seen == [("s6x", "Siel")]
+
+
+def test_character_item_details_is_opt_in():
+    asked = []
+
+    def fake_get_character(cid, sid, region, item_details):
+        asked.append(item_details)
+        return {"profile": {}}
+
+    with fakes(resolve_character=lambda name, server=None: dict(S6X), get_character=fake_get_character):
+        assert client.get("/characters/s6x").status_code == 200
+        assert client.get("/characters/s6x", params={"item_details": "true"}).status_code == 200
+        assert client.get("/characters/s6x", params={"item_details": "false"}).status_code == 200
+        assert asked == [False, True, False], asked
+        assert client.get("/characters/s6x", params={"item_details": "maybe"}).status_code == 422
+
+
+ITEM_QUERY = {
+    "characterId": "rKx=", "serverId": "1501", "id": "110130050",
+    "slotPos": "1", "enchantLevel": "10", "exceedLevel": "0",
+}
+DETAIL = {"id": 110130050, "soulBindRate": "50.4", "subStats": [{"id": "Critical", "value": "56"}], "godStoneStat": []}
+no_call = raises(AssertionError("must not be called"))
+
+
+def test_equipment_item_forwards_one_item_without_lookups():
+    seen = []
+
+    def fake_item(character_id, server_id, item, region):
+        seen.append((character_id, server_id, item, region))
+        return dict(DETAIL)
+
+    with fakes(
+        get_equipment_item=fake_item,
+        resolve_server_region=lambda s: "as" if s == "1501" else None,
+        resolve_character=no_call,
+        get_character=no_call,
+        character_endpoint=no_call,
+    ):
+        r = client.get("/characters/equipment/item", params=ITEM_QUERY)
+        assert r.status_code == 200, r.text
+        assert r.json() == DETAIL, "passed through unchanged"
+        assert seen == [("rKx=", "1501", {"id": 110130050, "slotPos": 1, "enchantLevel": 10, "exceedLevel": 0}, "as")]
+
+        seen.clear()  # an explicit region is used as given
+        assert client.get("/characters/equipment/item", params={**ITEM_QUERY, "region": "nae"}).status_code == 200
+        assert seen[0][3] == "nae"
+
+
+def test_equipment_item_rejects_missing_or_invalid_parameters():
+    bad = [{k: v for k, v in ITEM_QUERY.items() if k != missing} for missing in ITEM_QUERY]
+    bad += [
+        {**ITEM_QUERY, **change}
+        for change in (
+            {"characterId": ""}, {"serverId": "Siel"}, {"serverId": "15"}, {"id": "0"}, {"id": "abc"},
+            {"slotPos": "0"}, {"enchantLevel": "-1"}, {"enchantLevel": "1.5"}, {"exceedLevel": "x"},
+            {"region": "global"},
+        )
+    ]
+    with fakes(get_equipment_item=no_call, resolve_server_region=no_call):
+        for params in bad:
+            r = client.get("/characters/equipment/item", params=params)
+            assert r.status_code == 422, (params, r.status_code, r.text)
+
+
+def test_equipment_item_maps_upstream_failures():
+    for upstream, expected in ((404, 404), (500, 502), (429, 503), (0, 502)):
+        with fakes(get_equipment_item=raises(Aion2ApiError(upstream, "https://x", "boom")), resolve_server_region=lambda s: "as"):
+            r = client.get("/characters/equipment/item", params=ITEM_QUERY)
+            assert r.status_code == expected, (upstream, r.status_code, r.text)
+
+
+def test_equipment_item_makes_exactly_one_upstream_request():
+    """End to end through the real client: one equipment/item URL, nothing else."""
+    import aion2_api
+
+    urls = []
+
+    def fake_get_json(url, headers, timeout, params=None):
+        urls.append((url, params))
+        return dict(DETAIL)
+
+    real = aion2_api.get_json
+    aion2_api.get_json = fake_get_json
+    try:
+        with fakes(resolve_server_region=lambda s: "as"):
+            assert client.get("/characters/equipment/item", params=ITEM_QUERY).json() == DETAIL
+        assert [u for u, _ in urls] == ["https://aion2.plaync.com/api/character/equipment/item"], urls
+        assert urls[0][1] == {
+            "region": "as", "lang": "en-US", "characterId": "rKx=", "serverId": "1501",
+            "id": 110130050, "slotPos": 1, "enchantLevel": 10, "exceedLevel": 0,
+        }, urls[0][1]
+    finally:
+        aion2_api.get_json = real
 
 
 def test_ambiguous_name_is_409_with_candidates():
@@ -217,6 +311,61 @@ def test_root_lists_character_routes():
     r = client.get("/")
     assert r.status_code == 200
     assert any("/characters/" in v for v in r.json()["how_to_use"].values())
+
+
+# --- internal key (AION2_API_INTERNAL_KEY) -----------------------------------
+# A made-up value for tests only; the real one lives in the deployment's env.
+TEST_KEY = "test-only-not-a-real-key"
+ROSTER_ROW = [{"server_id": "1101", "name": "Siel", "short_name": "SIE", "faction": "Elyos", "region": "nae"}]
+PROTECTED = ["/servers/roster", "/notices", "/characters/s6x", "/openapi.json", "/docs"]
+
+
+def test_internal_key_root_stays_open():
+    with fakes(INTERNAL_KEY=TEST_KEY):
+        r = client.get("/")
+    assert r.status_code == 200, r.text
+    assert "how_to_use" in r.json()
+
+
+def test_internal_key_missing_header_is_401():
+    with fakes(INTERNAL_KEY=TEST_KEY, server_list=raises(AssertionError("upstream must not be called"))):
+        for path in PROTECTED:
+            r = client.get(path)
+            assert r.status_code == 401, (path, r.status_code)
+            assert r.json() == {"detail": "Missing or invalid internal key"}
+            assert TEST_KEY not in r.text
+
+
+def test_internal_key_wrong_header_is_401():
+    with fakes(INTERNAL_KEY=TEST_KEY, server_list=raises(AssertionError("upstream must not be called"))):
+        # raw non-ASCII bytes too: the server decodes them as latin-1, and the
+        # comparison must reject them rather than raise a 500
+        for wrong in ["nope", TEST_KEY + "x", TEST_KEY[:-1], "", "ключ".encode("utf-8")]:
+            r = client.get("/servers/roster", headers={"X-Internal-Key": wrong})
+            assert r.status_code == 401, (wrong, r.status_code)
+            assert TEST_KEY not in r.text
+
+
+def test_internal_key_correct_header_reaches_the_route():
+    with fakes(INTERNAL_KEY=TEST_KEY, server_list=lambda timeout=25.0: ROSTER_ROW):
+        r = client.get("/servers/roster", headers={"X-Internal-Key": TEST_KEY})
+        assert r.status_code == 200, r.text
+        assert r.json()[0]["server_id"] == "1101"
+        # the header name is case-insensitive, as HTTP headers are
+        assert client.get("/openapi.json", headers={"x-internal-key": TEST_KEY}).status_code == 200
+    # errors keep their usual statuses and shapes behind the key
+    with fakes(INTERNAL_KEY=TEST_KEY, server_list=raises(Aion2ApiError(0, "https://x", "down"))):
+        r = client.get("/servers/roster", headers={"X-Internal-Key": TEST_KEY})
+        assert r.status_code == 502 and "detail" in r.json()
+
+
+def test_internal_key_unset_keeps_api_open():
+    # "" is what an unset or blank AION2_API_INTERNAL_KEY becomes
+    with fakes(INTERNAL_KEY="", server_list=lambda timeout=25.0: ROSTER_ROW):
+        assert client.get("/servers/roster").status_code == 200
+        # a stray header is ignored rather than rejected
+        assert client.get("/servers/roster", headers={"X-Internal-Key": "anything"}).status_code == 200
+        assert client.get("/openapi.json").status_code == 200
 
 
 def main():

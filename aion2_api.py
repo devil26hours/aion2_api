@@ -217,6 +217,7 @@ def get_json(url: str, headers: Dict[str, str], timeout: float, params: Optional
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
+        _response_cache.pop(url, None)  # a broken body is a failure, not something to reuse
         raise Aion2ApiError(0, url, f"not JSON: {raw[:300]}") from exc
 
 
@@ -760,6 +761,8 @@ def server_drift(
 #       -> {profile, stat: {statList}, title, ranking, daevanion}
 #   GET https://aion2.plaync.com/api/character/equipment   (same params)
 #       -> {equipment: {equipmentList, skinList}, petwing, skill: {skillList}}
+#   GET https://aion2.plaync.com/api/character/equipment/item   (+ per-item params,
+#       see get_equipment_item) -> one item's soulBindRate, subStats, stones, ...
 #
 # `region` is mandatory for Global and must be the real one, else a bare 404.
 CHARACTER_REGIONS = ["nae", "naw", "eu", "la", "as"]
@@ -971,12 +974,107 @@ def character_endpoint(
     raise AssertionError("unreachable")
 
 
-def get_character(
-    character_id: str, server_id: str, region: Optional[str] = None, timeout: float = 25.0
+# One item's tooltip (rolled stats, soul binding, stones), keyed by fields that
+# every equipmentList entry carries:
+#   GET https://aion2.plaync.com/api/character/equipment/item
+#         ?{the character params}&id={n}&slotPos={n}&enchantLevel={n}&exceedLevel={n}
+#       -> {soulBindRate, mainStats, subStats, subStatCount, subSkillCountMax,
+#           magicStoneStat, godStoneStat, ...}
+EQUIPMENT_ITEM_PARAMS = ("id", "slotPos", "enchantLevel", "exceedLevel")
+# Statuses after which asking for the next item is pointless or impolite: blocked,
+# or still told to come back later once _fetch has used up its retries.
+_STOP_ITEM_DETAILS = (403, 429, 503)
+# Identical item requests in flight at once (a frontend hovering, a double click)
+# share one upstream call: the first does it, the rest wait and read the cache.
+# key -> [lock, number of callers using it], dropped when the last one leaves.
+_item_inflight: Dict[Tuple[Any, ...], List[Any]] = {}
+_item_inflight_lock = threading.Lock()
+
+
+def get_equipment_item(
+    character_id: str,
+    server_id: str,
+    item: Dict[str, Any],
+    region: Optional[str] = None,
+    timeout: float = 25.0,
 ) -> Dict[str, Any]:
-    """Character info + equipment merged."""
+    """One equipped item's detail, passed through unchanged.
+
+    `item` is an entry of equipment['equipmentList'] (or any dict with the same
+    four keys). Raises ValueError when it lacks an integer id/slotPos/
+    enchantLevel/exceedLevel, else whatever the HTTP layer raises. Cached like
+    every request, by its full URL - so per character, item, slot and level.
+    """
+    params: Dict[str, int] = {}
+    for key in EQUIPMENT_ITEM_PARAMS:
+        value = item.get(key)
+        if isinstance(value, bool) or not (
+            isinstance(value, int) or (isinstance(value, str) and value.isdigit())
+        ):
+            raise ValueError(f"equipment item has no usable {key!r}: {value!r}")
+        params[key] = int(value)
+
+    key = (region, urllib.parse.unquote(character_id), str(server_id), *params.values())
+    with _item_inflight_lock:
+        entry = _item_inflight.setdefault(key, [threading.Lock(), 0])
+        entry[1] += 1
+    try:
+        with entry[0]:  # a caller that waited here finds the answer in the cache
+            data, _ = character_endpoint("equipment/item", character_id, server_id, region, timeout, **params)
+    finally:
+        with _item_inflight_lock:
+            entry[1] -= 1
+            if not entry[1]:
+                _item_inflight.pop(key, None)
+    if not isinstance(data, dict):
+        raise Aion2ApiError(0, "equipment/item", f"expected an object, got {type(data).__name__}")
+    return data
+
+
+def _attach_item_details(
+    equipment: Dict[str, Any], character_id: str, server_id: str, region: str, timeout: float
+) -> None:
+    """Give each equipmentList entry an `itemDetail`, one request per item, in order.
+
+    Best effort: an item whose detail is unusable or fails keeps its entry as it
+    was, just without `itemDetail`. Sequential on purpose - the throttle spaces
+    these 1s apart, so ~25 items cost ~25s the first time (then CACHE_TTL helps).
+    """
+    for item in (equipment.get("equipment") or {}).get("equipmentList") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            detail = get_equipment_item(character_id, server_id, item, region, timeout)
+        except ValueError:
+            continue  # nothing valid to ask for
+        except Aion2ApiError as exc:
+            if exc.status in _STOP_ITEM_DETAILS:
+                break
+            continue
+        except OSError:  # a read timeout; the next item would most likely hang too
+            break
+        if isinstance(detail, dict):
+            item["itemDetail"] = detail
+
+
+def get_character(
+    character_id: str,
+    server_id: str,
+    region: Optional[str] = None,
+    timeout: float = 25.0,
+    item_details: bool = False,
+) -> Dict[str, Any]:
+    """Character info + equipment merged: two requests.
+
+    With `item_details`, each equipment.equipmentList entry also gets `itemDetail`
+    (see `get_equipment_item`) when that item's detail could be fetched. That is
+    one more request per item (~25, spaced 1s apart by the throttle), so it is
+    off by default and the plain answer stays as fast as it always was.
+    """
     info, region = character_endpoint("info", character_id, server_id, region, timeout)
     equipment, _ = character_endpoint("equipment", character_id, server_id, region, timeout)
+    if item_details:
+        _attach_item_details(equipment, character_id, server_id, region, timeout)
     return {**info, **equipment}
 
 
@@ -1144,7 +1242,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
 
         if args.cmd == "character":
-            data = get_character(c["character_id"], c["server_id"], c["region"])
+            # The text view never shows item details, so only --json pays for them.
+            data = get_character(c["character_id"], c["server_id"], c["region"], item_details=args.json)
             if args.json:
                 print(json.dumps(data, ensure_ascii=False, indent=2))
                 return 0

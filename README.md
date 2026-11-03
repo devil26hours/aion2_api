@@ -6,7 +6,8 @@ Read AION 2 announcements, in-game events, live server population and any charac
 gear and Daevanion boards as clean JSON, instead of loading the website in a browser and
 copy-pasting out of a web page.
 
-No API key, no account, no login. The data is public.
+No API key, no account, no login. The data is public. (Deploying it for your own backend only?
+You can [lock it with a shared key](#locking-a-deployment-to-your-backend).)
 
 ```json
 {
@@ -77,6 +78,7 @@ python aion2_api.py list -n 5
 | `GET /characters/{name}` | One character's stats, gear, skills, titles and ranking |
 | `GET /characters/{name}/daevanion` | That character's Daevanion boards |
 | `GET /characters/{name}/daevanion/{board}` | One board, node by node (`board` is a name like `Nezekan`, or an id) |
+| `GET /characters/equipment/item?characterId=&serverId=&id=&slotPos=&enchantLevel=&exceedLevel=` | One equipped item's details — soul binding, rolled stats, stones. One upstream request, no name lookup; the ids come from a `/characters/{name}` answer |
 | `GET /` | A reminder of the above |
 
 `/notices`, `/events` and `/servers` need no arguments at all. Everything else is optional:
@@ -92,6 +94,10 @@ python aion2_api.py list -n 5
 | `region` | `/servers` | – | Region, e.g. `NA East`, `Europe`, `Asia` |
 | `region` | `/characters/search` | all | One of `nae`, `naw`, `eu`, `la`, `as` |
 | `server` | `/characters/{name}...` | – | Server name or id, e.g. `Siel` or `1101` — needed when the name exists on more than one server. An id is faster: it searches one region instead of five |
+| `item_details` | `/characters/{name}` | `false` | Also attach each equipped item's `itemDetail` (soul binding, rolled stats, stones). Costs one upstream request per item, so roughly 25 s slower when not cached — for an interactive page, fetch items one at a time from `/characters/equipment/item` instead |
+| `characterId`, `serverId` | `/characters/equipment/item` | required | `profile.characterId` and `profile.serverId` from `/characters/{name}` |
+| `id`, `slotPos`, `enchantLevel`, `exceedLevel` | `/characters/equipment/item` | required | The same four fields of the `equipment.equipmentList` entry — whole numbers, never defaulted |
+| `region` | `/characters/equipment/item` | the server's | One of `nae`, `naw`, `eu`, `la`, `as` |
 
 Available boards: `notice_en`, `notice_de`, `notice_fr`, `notice_es`, `notice_pt`.
 
@@ -115,6 +121,7 @@ curl "http://127.0.0.1:8000/characters/search?name=s6x"         # who is called 
 curl "http://127.0.0.1:8000/characters/s6x?server=Siel"         # stats, gear, skills
 curl "http://127.0.0.1:8000/characters/s6x/daevanion?server=Siel"          # their boards
 curl "http://127.0.0.1:8000/characters/s6x/daevanion/Nezekan?server=Siel"  # one board
+curl "http://127.0.0.1:8000/characters/equipment/item?characterId=nJOC5G0srR3cLYkKRj4zD2ziweuQDwo6wvhjvjwrfzg%3D&serverId=1501&id=110430047&slotPos=1&enchantLevel=12&exceedLevel=0"  # one item
 ```
 
 Character responses are NCSOFT's own JSON passed through — see
@@ -157,6 +164,7 @@ Samples for all of them are in [docs/API.md](docs/API.md#responses).
 
 | Status | Meaning |
 |---|---|
+| `401` | Only when `AION2_API_INTERNAL_KEY` is set: the `X-Internal-Key` header is missing or wrong |
 | `404` | No such article, or a board name that does not exist (the message lists the valid ones), or no character with that exact name |
 | `409` | Several characters share that name — the body lists `candidates`; add `?server=` |
 | `422` | A parameter is out of range or unknown, e.g. `limit=999` or `status=NOPE` |
@@ -165,6 +173,15 @@ Samples for all of them are in [docs/API.md](docs/API.md#responses).
 
 ---
 
+
+## Locking a deployment to your backend
+
+Out of the box the API is open, which is what you want locally. When it is deployed for one
+server-side caller — say a Next.js backend — set `AION2_API_INTERNAL_KEY` and every route except
+`/` then answers `401` unless the request carries the same value in an `X-Internal-Key` header.
+`/` stays open for platform health checks; it is static and never calls upstream. Unset or blank,
+nothing changes. Setup, key generation and the Railway/Next.js side are in
+[docs/DOCKER.md](docs/DOCKER.md#locking-it-to-your-backend).
 
 ## Rate limits and politeness
 

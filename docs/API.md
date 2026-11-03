@@ -192,10 +192,30 @@ merged into one dict:
 | `stat.statList[]` | info | `name`, `value`, `type` and the bonus text in `statSecondList` |
 | `title`, `ranking` | info | Titles and ranking entries |
 | `daevanion.boardList[]` | info | Board `id`, `name`, `openNodeCount` / `totalNodeCount`, `openPercent` |
-| `equipment.equipmentList[]` | equipment | Equipped items: `slotPosName`, `name`, `enchantLevel`, `grade`, `icon` |
+| `equipment.equipmentList[]` | equipment | Equipped items: `id`, `slotPos`, `slotPosName`, `name`, `enchantLevel`, `exceedLevel`, `grade`, `icon` |
+| `equipment.equipmentList[].itemDetail` | equipment/item | Only with `item_details` on, and only for items whose detail could be fetched: the per-item response unchanged — `soulBindRate`, `mainStats`, `subStats`, `subStatCount`, `subSkillCountMax`, `magicStoneStat`, `godStoneStat`, and `subSkills` when NCSOFT sends it |
 | `equipment.skinList[]` | equipment | Cosmetic skins |
 | `petwing` | equipment | `pet`, `wing`, `wingSkin` |
 | `skill.skillList[]` | equipment | Skills with `skillLevel`, `category`, `equip` |
+
+One item's details (`get_equipment_item`, `GET /characters/equipment/item`) is the same object as
+`itemDetail` above, for exactly one item, passed through unchanged — keys NCSOFT leaves out stay
+out (armor, for one, has no god-stone slot and so no `godStoneStat`). It needs no name lookup and no
+info or equipment request — just one upstream call, with the ids a character answer already holds:
+
+| Parameter | Taken from | Rules |
+|---|---|---|
+| `characterId` | `profile.characterId` | Required, non-empty (`=` may be sent as `%3D`) |
+| `serverId` | `profile.serverId` | Required, four digits |
+| `id`, `slotPos` | the `equipmentList` entry | Required whole numbers, at least 1 |
+| `enchantLevel`, `exceedLevel` | the `equipmentList` entry | Required whole numbers, at least 0 |
+| `region` | optional | Defaults to the server's region (NCSOFT's roster, else the id's digits) |
+
+A missing or malformed parameter is a `422` and nothing is sent upstream. An item NCSOFT does not
+know is a `404`; other upstream failures are `502`, or `503` when rate-limited. Answers are cached
+for 60 seconds by their full upstream URL, so each character + item + slot + level combination has
+its own entry; a failure is never cached. Identical requests that arrive together share one
+upstream call.
 
 A Daevanion board (`get_daevanion_board`) has `nodeList[]` (`row`, `col`, `type` —
 `Start`/`Stat`/`SkillLevel`/`None`, `open`, `grade`, `name`, `effectList`) plus
@@ -209,6 +229,7 @@ Endpoints behind them (no key, no login):
 | Info | `GET https://aion2.plaync.com/api/character/info?region=&lang=en-US&characterId=&serverId=` |
 | Equipment | `GET https://aion2.plaync.com/api/character/equipment` (same parameters) |
 | Daevanion board | `GET https://aion2.plaync.com/api/character/daevanion/detail` (same, plus `boardId=`) |
+| One item's detail | `GET https://aion2.plaync.com/api/character/equipment/item` (same, plus the item's `id=&slotPos=&enchantLevel=&exceedLevel=`) |
 
 `region` must be the real one (`nae`, `naw`, `eu`, `la`, `as`) or the answer is a bare `404`.
 Character ids end in `=`; search returns them already encoded (`%3D`) and fan-site links
