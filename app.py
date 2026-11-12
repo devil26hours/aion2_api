@@ -7,6 +7,8 @@
     GET /servers/roster       the server list itself (first-party, no population)
     GET /characters/search    find characters by name
     GET /characters/{name}    stats, gear, skills (?server= when the name is ambiguous)
+    GET /characters/by-id     the same, from characterId + serverId (no name search)
+    GET /characters/by-id/daevanion   one Daevanion board by ids (+ boardId)
     GET /characters/{name}/daevanion[/{board}]   Daevanion boards
     GET /characters/equipment/item   one equipped item's details, by ids
 
@@ -390,6 +392,49 @@ def character_equipment_item(
     return get_equipment_item(
         character_id, server_id, item, region or resolve_server_region(server_id)
     )
+
+
+@app.get(
+    "/characters/by-id",
+    tags=["characters"],
+    summary="A character's stats, gear and skills, by ids (no name search)",
+)
+def character_by_id(
+    character_id: str = Query(
+        ..., alias="characterId", min_length=1, max_length=128, description="`character_id` from /characters/search"
+    ),
+    server_id: str = Query(..., alias="serverId", pattern=r"^\d{4}$", description="`server_id`, e.g. 1101"),
+    region: Optional[Literal["nae", "naw", "eu", "la", "as"]] = Query(
+        None, description="Default: the server's own region"
+    ),
+    item_details: bool = Query(False, description="Same as on /characters/{name}"),
+) -> Dict[str, Any]:
+    """Exactly the answer of /characters/{name}, but from the ids a search hit already
+    carries, so it costs the two profile requests and no name search. 404 when the
+    ids match no character (e.g. it was deleted)."""
+    return get_character(character_id, server_id, region or resolve_server_region(server_id), item_details=item_details)
+
+
+@app.get(
+    "/characters/by-id/daevanion",
+    tags=["characters"],
+    summary="One Daevanion board node by node, by ids (no name search)",
+)
+def character_daevanion_board_by_id(
+    character_id: str = Query(
+        ..., alias="characterId", min_length=1, max_length=128, description="`character_id` from /characters/search"
+    ),
+    server_id: str = Query(..., alias="serverId", pattern=r"^\d{4}$", description="`server_id`, e.g. 1101"),
+    board_id: int = Query(..., alias="boardId", ge=1, description="`daevanion.boardList[].id` of a profile"),
+    region: Optional[Literal["nae", "naw", "eu", "la", "as"]] = Query(
+        None, description="Default: the server's own region"
+    ),
+) -> Dict[str, Any]:
+    """NCSOFT's board detail passed through unchanged: `nodeList` (the full 15x15
+    grid; each node has `row`, `col`, `type`, `grade`, `open`, `name`, `icon`,
+    `effectList`), `openStatEffectList`, `openSkillEffectList`. One upstream
+    request: the board id comes from the profile the caller already has."""
+    return get_daevanion_board(character_id, server_id, board_id, region or resolve_server_region(server_id))
 
 
 @app.get("/characters/{name}", tags=["characters"], summary="A character's stats, gear and skills")

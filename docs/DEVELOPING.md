@@ -36,8 +36,9 @@ and the character code (link parsing, region fallback, the first-party roster an
 mapping, the roster-backed region lookup and its offline fallback, name resolution and its cache,
 Daevanion grid placement).
 
-`test_app.py` (22 checks) drives the FastAPI app through its test client with the upstream calls
-faked: search and its `region` validation, `?server=` pass-through, `409` with `candidates` for
+`test_app.py` (25 checks) drives the FastAPI app through its test client with the upstream calls
+faked: search and its `region` validation, `?server=` pass-through, `/characters/by-id` (no name
+search, `404` for an unknown id) and `/characters/by-id/daevanion` (one board call, no lookups), `409` with `candidates` for
 an ambiguous name, `404` for an unknown name or board, a `/servers` response whose optional
 population columns are `null`, `/servers/roster` and its `502` when the upstream list fails,
 board lookup by name or id, how upstream failures map to `404` / `502` / `503`, and the

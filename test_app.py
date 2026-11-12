@@ -101,6 +101,55 @@ def test_character_item_details_is_opt_in():
         assert client.get("/characters/s6x", params={"item_details": "maybe"}).status_code == 422
 
 
+def test_character_by_id_skips_the_name_search():
+    asked = []
+
+    def fake_get_character(cid, sid, region, item_details):
+        asked.append((cid, sid, region, item_details))
+        return {"profile": {"characterName": "s6x"}}
+
+    with fakes(
+        get_character=fake_get_character,
+        resolve_server_region=lambda s: "nae" if s == "1101" else None,
+        resolve_character=raises(AssertionError("must not search by name")),
+        search_characters=raises(AssertionError("must not search by name")),
+    ):
+        r = client.get("/characters/by-id", params={"characterId": "a=", "serverId": "1101"})
+        assert r.status_code == 200, r.text
+        assert r.json() == {"profile": {"characterName": "s6x"}}
+        assert client.get("/characters/by-id", params={"characterId": "a=", "serverId": "1101", "region": "as"}).status_code == 200
+        assert asked == [("a=", "1101", "nae", False), ("a=", "1101", "as", False)], asked
+        assert client.get("/characters/by-id", params={"characterId": "a="}).status_code == 422, "serverId is required"
+        assert client.get("/characters/by-id", params={"characterId": "a=", "serverId": "11x1"}).status_code == 422
+        assert client.get("/characters/by-id", params={"characterId": "a=", "serverId": "1101", "region": "xx"}).status_code == 422
+
+
+def test_daevanion_board_by_id_is_one_call_without_name_search():
+    asked = []
+
+    def fake_board(cid, sid, board_id, region):
+        asked.append((cid, sid, board_id, region))
+        return {"nodeList": [{"row": 8, "col": 8, "type": "Start"}], "openStatEffectList": [], "openSkillEffectList": []}
+
+    with fakes(
+        get_daevanion_board=fake_board,
+        resolve_server_region=lambda s: "nae" if s == "1101" else None,
+        resolve_character=raises(AssertionError("must not search by name")),
+        character_endpoint=raises(AssertionError("must not fetch the profile")),
+    ):
+        r = client.get("/characters/by-id/daevanion", params={"characterId": "a=", "serverId": "1101", "boardId": "71"})
+        assert r.status_code == 200, r.text
+        assert r.json()["nodeList"][0]["type"] == "Start"
+        assert asked == [("a=", "1101", 71, "nae")], asked
+        assert client.get("/characters/by-id/daevanion", params={"characterId": "a=", "serverId": "1101"}).status_code == 422, "boardId is required"
+        assert client.get("/characters/by-id/daevanion", params={"characterId": "a=", "serverId": "1101", "boardId": "x"}).status_code == 422
+
+
+def test_character_by_id_maps_an_unknown_id_to_404():
+    with fakes(get_character=raises(Aion2ApiError(404, "https://x", "")), resolve_server_region=lambda s: "nae"):
+        assert client.get("/characters/by-id", params={"characterId": "zz=", "serverId": "1101"}).status_code == 404
+
+
 ITEM_QUERY = {
     "characterId": "rKx=", "serverId": "1501", "id": "110130050",
     "slotPos": "1", "enchantLevel": "10", "exceedLevel": "0",

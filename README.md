@@ -76,6 +76,8 @@ python aion2_api.py list -n 5
 | `GET /servers/roster` | The server list itself, straight from NCSOFT — no population |
 | `GET /characters/search?name=` | Characters whose name contains `name` |
 | `GET /characters/{name}` | One character's stats, gear, skills, titles and ranking |
+| `GET /characters/by-id?characterId=&serverId=` | The same answer, from the ids a search hit carries — no name search (optional `region`, `item_details`) |
+| `GET /characters/by-id/daevanion?characterId=&serverId=&boardId=` | One Daevanion board node by node (`boardId` from `daevanion.boardList`) — one upstream request, no name search |
 | `GET /characters/{name}/daevanion` | That character's Daevanion boards |
 | `GET /characters/{name}/daevanion/{board}` | One board, node by node (`board` is a name like `Nezekan`, or an id) |
 | `GET /characters/equipment/item?characterId=&serverId=&id=&slotPos=&enchantLevel=&exceedLevel=` | One equipped item's details — soul binding, rolled stats, stones. One upstream request, no name lookup; the ids come from a `/characters/{name}` answer |
